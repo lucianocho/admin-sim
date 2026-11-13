@@ -202,9 +202,149 @@ def case5(step):
             "그래서 현실의 정책 결정은 투표가 아니라 협상, 중재, 의제 설정 규칙 같은 제도 설계에 의존합니다.")
 
 
-def render():
+# ── 실시간 모드: AI가 선호를 생성 ───────────────────────
+import itertools
+import json
+import re
+
+PERSONAS = {
+    "경제학자": "노동시장, 주거비, 재정 효율을 중시하는 노동경제학자",
+    "사회학자": "성평등, 가족 가치관, 일·생활 균형을 연구하는 가족사회학자",
+    "정책전문가": "중앙부처에서 저출산 대책을 집행해 본 정책 실무 전문가",
+    "지자체 담당자": "인구 감소 지역 군청의 인구정책 담당 팀장",
+    "청년 당사자": "수도권에서 맞벌이를 하는 30대 초반 직장인",
+}
+DESC = {"A": "구조개혁(노동시장·주거 구조 개편)", "B": "정책지원(현금·돌봄 서비스 확대)",
+        "C": "문화변화(성평등·일생활균형 문화 확산)", "D": "이민 확대(외국 인력·이민 수용)"}
+
+
+def ask_rank(ask, name, alts):
+    opts = "\n".join(f"- {DESC[a]}" for a in alts)
+    system = (f"당신은 {PERSONAS[name]}이다. 저출산 대책의 우선순위를 정하는 정부 위원회에 참석했다. "
+              "자신의 전문성과 처지에서 솔직하게 판단한다. 다른 위원의 눈치를 보지 않는다.")
+    user = (f"다음 대안을 가장 우선해야 할 것부터 순서대로 모두 나열하라.\n{opts}\n\n"
+            'JSON만 출력한다. 형식: {"ranking": ["' + '", "'.join(NAMES[a] for a in alts) + '"], "reason": "한 문장"}\n'
+            "ranking에는 위 대안의 이름(괄호 앞 단어)을 정확히 한 번씩 쓴다.")
+    inv = {NAMES[a]: a for a in alts}
+    for _ in range(2):
+        try:
+            d = json.loads(re.search(r"\{.*\}", ask(system, [{"role": "user", "content": user}], 300), re.S).group(0))
+            rank = "".join(inv[x.strip()] for x in d["ranking"])
+            if sorted(rank) == sorted(alts):
+                return rank, str(d.get("reason", ""))
+        except Exception:
+            pass
+    return None, None
+
+
+def analyze(prof, alts):
+    n = len(prof); out = {}
+    wins = {a: sum(pair_count(prof, a, b) > n / 2 for b in alts if b != a) for a in alts}
+    out["condorcet"] = next((a for a in alts if wins[a] == len(alts) - 1), None)
+    cyc = None
+    for x, y, z in itertools.permutations(alts, 3):
+        if pair_count(prof, x, y) > n / 2 and pair_count(prof, y, z) > n / 2 and pair_count(prof, z, x) > n / 2:
+            cyc = (x, y, z); break
+    out["cycle"] = cyc
+    p, b = plurality(prof, alts), borda(prof, alts)
+    out["plur"], out["borda"] = p, b
+    out["rule_diff"] = winner(p) is not None and winner(b) is not None and winner(p) != winner(b)
+    flip = None
+    for z in alts:
+        rest = [a for a in alts if a != z]; b2 = borda(prof, rest)
+        for x, y in itertools.combinations(rest, 2):
+            if (b[x] - b[y]) * (b2[x] - b2[y]) < 0:
+                flip = (z, x, y, b2); break
+        if flip: break
+    out["iia"] = flip
+    man = None; w = winner(b)
+    if w:
+        for i, true in enumerate(prof):
+            for lie in itertools.permutations(alts):
+                q = list(prof); q[i] = "".join(lie); w2 = winner(borda(q, alts))
+                if w2 and w2 != w and prefers(true, w2, w):
+                    man = (i, "".join(lie), w2); break
+            if man: break
+    out["manip"] = man
+    return out
+
+
+def live(ask):
+    ss = st.session_state
+    st.caption("AI 에이전트가 각자의 처지에서 선호를 정하고, 집계와 판정은 코드가 계산합니다. 실행할 때마다 결과가 달라질 수 있습니다.")
+    n = st.radio("에이전트 수", [3, 4, 5], horizontal=True, key="live_n")
+    alts = "ABC" if n == 3 else "ABCD"
+    agents = list(PERSONAS)[:n]
+    ss.setdefault("live_runs", [])
+    if st.button("에이전트에게 선호 묻기", type="primary"):
+        res = []
+        with st.spinner("에이전트가 선호를 정하는 중입니다."):
+            for name in agents:
+                try:
+                    rank, reason = ask_rank(ask, name, alts)
+                except Exception as e:
+                    st.error(f"AI 호출에 실패했습니다. 사이드바의 키와 모델 이름을 확인하세요. ({type(e).__name__})"); st.stop()
+                if not rank:
+                    st.error(f"{name}의 응답을 해석하지 못했습니다. 다시 눌러 주세요."); st.stop()
+                res.append((name, rank, reason))
+        ss.live_cur = (n, alts, res)
+        o = analyze([r[1] for r in res], alts)
+        ss.live_runs.append({"에이전트": n, "순환": "발생" if o["cycle"] else "없음",
+                             "규칙별 승자": "다름" if o["rule_diff"] else "같음",
+                             "의제에 따른 역전": "발생" if o["iia"] else "없음",
+                             "거짓 표명의 이득": "가능" if o["manip"] else "없음"})
+    cur = ss.get("live_cur")
+    if not cur or cur[0] != n:
+        st.info("버튼을 누르면 에이전트가 선호를 생성합니다.")
+    else:
+        _, alts, res = cur; prof = [r[1] for r in res]; o = analyze(prof, alts)
+        st.subheader("① 에이전트의 주장과 선호")
+        speak(res)
+        st.subheader("② 쌍대 다수결")
+        rows = [{"대결": f"{NAMES[a]} 대 {NAMES[b]}", "득표": f"{pair_count(prof, a, b)} : {len(prof) - pair_count(prof, a, b)}"}
+                for a, b in itertools.combinations(alts, 2)]
+        st.table(pd.DataFrame(rows).set_index("대결"))
+        if o["cycle"]:
+            st.error("순환 발생: " + " > ".join(NAMES[x] for x in o["cycle"]) + f" > {NAMES[o['cycle'][0]]}")
+        elif o["condorcet"]:
+            st.success(f"이번에는 순환이 없습니다. 모든 대결에서 이기는 대안: {NAMES[o['condorcet']]}")
+        else:
+            st.warning("모든 대결에서 이기는 대안이 없습니다(동률 포함).")
+        st.subheader("③ 집계 규칙별 승자")
+        l, r = st.columns(2)
+        with l:
+            w = winner(o["plur"]); st.markdown(f"**최다득표제** → {'**' + NAMES[w] + '**' if w else '동률'}"); score_chart(o["plur"], "1순위 득표")
+        with r:
+            w = winner(o["borda"]); st.markdown(f"**보르다 점수제** → {'**' + NAMES[w] + '**' if w else '동률'}"); score_chart(o["borda"], "보르다 점수")
+        st.subheader("④ 의제 변경과 거짓 표명")
+        if o["iia"]:
+            z, x, y, _ = o["iia"]
+            st.error(f"'{NAMES[z]}'를 의제에서 빼면 보르다 점수제에서 {NAMES[x]}와 {NAMES[y]}의 순위가 뒤집힙니다.")
+        else:
+            st.success("이번 선호에서는 대안 하나를 빼도 보르다 순위가 뒤집히지 않습니다.")
+        if o["manip"]:
+            i, lie, w2 = o["manip"]
+            st.error(f"{res[i][0]}가 선호를 '{fmt(lie)}'로 거짓 표명하면 승자가 {NAMES[w2]}로 바뀌어 본인에게 유리해집니다.")
+        else:
+            st.success("이번 선호에서는 한 명의 거짓 표명으로 결과를 유리하게 바꿀 수 없습니다.")
+    if ss.live_runs:
+        st.divider()
+        st.subheader("실행 기록")
+        st.caption("문제가 매번 나타나지는 않습니다. 정리가 말하는 것은 어떤 규칙도 모든 경우에 문제를 피할 수는 없다는 점입니다.")
+        df = pd.DataFrame(ss.live_runs); df.index = [f"{i + 1}회" for i in range(len(df))]
+        st.table(df)
+        if st.button("기록 지우기"):
+            ss.live_runs = []; ss.pop("live_cur", None); st.rerun()
+
+
+def render(ask=None):
     ss = st.session_state
     st.title("🗳️ 애로우 불가능성 정리 시연")
+    if ask is not None:
+        mode = st.radio("모드", ["설계된 선호 (시연)", "AI가 생성한 선호 (실시간)"], horizontal=True)
+        if mode.startswith("AI"):
+            live(ask)
+            return
     st.caption("저출산 대책의 우선순위 정하기 · 에이전트 수를 늘려 가며 집계 규칙의 한계를 확인 · 선호는 시연용 설계, 집계는 코드가 계산")
     n = st.radio("에이전트 수", [3, 4, 5], horizontal=True,
                  format_func=lambda k: {3: "3명 · 다수결의 순환", 4: "4명 · 규칙과 의제에 따른 역전", 5: "5명 · 거짓 표명과 독재"}[k])

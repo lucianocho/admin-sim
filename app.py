@@ -23,27 +23,36 @@ def secret(name, default=None):
     return os.environ.get(name, default)
 
 
-API_KEY = secret("ANTHROPIC_API_KEY")
-MODEL = secret("MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = secret("MODEL", "claude-opus-5-5")
 ACCESS_CODE = secret("ACCESS_CODE")
 
 
-@st.cache_resource
 def client():
-    import anthropic
-    return anthropic.Anthropic(api_key=API_KEY)
+    """키는 이 브라우저 세션의 메모리에만 둔다. 파일이나 저장소에 기록하지 않는다."""
+    if "_client" not in st.session_state:
+        import anthropic
+        st.session_state["_client"] = anthropic.Anthropic(api_key=st.session_state["api_key"])
+    return st.session_state["_client"]
 
 
 def ask(system, messages, max_tokens=700):
-    r = client().messages.create(model=MODEL, max_tokens=max_tokens,
+    r = client().messages.create(model=st.session_state["model"], max_tokens=max_tokens,
                                  system=system, messages=messages)
     return "".join(b.text for b in r.content if b.type == "text").strip()
 
 
 def stream(system, messages):
-    with client().messages.stream(model=MODEL, max_tokens=700,
+    with client().messages.stream(model=st.session_state["model"], max_tokens=700,
                                   system=system, messages=messages) as s:
         yield from s.text_stream
+
+
+def explain(e):
+    n = type(e).__name__
+    return {"AuthenticationError": "API 키가 올바르지 않습니다. 사이드바에서 다시 입력하세요.",
+            "NotFoundError": "모델 이름을 찾을 수 없습니다. 사이드바의 모델 이름을 확인하세요.",
+            "PermissionDeniedError": "이 키로는 해당 모델을 쓸 수 없습니다.",
+            "RateLimitError": "호출 한도에 걸렸습니다. 잠시 뒤 다시 시도하세요."}.get(n, f"AI 호출에 실패했습니다. ({n})")
 
 
 # ── 상태 ────────────────────────────────────────────────
@@ -53,6 +62,9 @@ ss.setdefault("phase", "brief")      # brief → chat → result → final
 ss.setdefault("stage", 0)
 ss.setdefault("chats", {})           # key → [{"role","content"}]
 ss.setdefault("results", {})         # key → {"decision":…, "coach":…}
+ss.setdefault("api_key", "")
+ss.setdefault("model", DEFAULT_MODEL)
+API_KEY = ss.api_key
 ss.setdefault("demo", not API_KEY)
 ss.setdefault("demo_pos", 0)
 ss.setdefault("authed", not ACCESS_CODE)
@@ -74,6 +86,33 @@ def scenario_picker():
                  format_func=lambda i: SCENARIOS[i]["name"])
 
 
+def _on_key():
+    ss.api_key = ss.key_input.strip()
+    ss.pop("_client", None)
+    ss.demo = not ss.api_key
+    reset()
+
+
+def _clear_key():
+    ss.api_key = ""
+    ss.key_input = ""
+    ss.pop("_client", None)
+    ss.demo = True
+    reset()
+
+
+def key_panel():
+    with st.expander("실시간 AI 설정", expanded=not ss.api_key):
+        st.text_input("Claude API 키", type="password", key="key_input", on_change=_on_key,
+                      placeholder="sk-ant-...", help="입력한 키는 이 브라우저 창에서만 쓰이고 저장되지 않습니다. 창을 닫거나 새로 고치면 사라집니다.")
+        st.text_input("모델", key="model")
+        if ss.api_key:
+            st.success("키 입력됨 · 실시간 모드 사용 가능")
+            st.button("키 지우기", on_click=_clear_key)
+        else:
+            st.caption("키가 없으면 예시 재생(시연) 모드로만 동작합니다.")
+
+
 # ── 접속코드 ────────────────────────────────────────────
 if not ss.authed:
     st.title("🏛️ 정책 설득 시뮬레이터")
@@ -89,8 +128,8 @@ if SCENARIOS[ss.sc].get("kind") == "arrow":
     import arrow_demo
     with st.sidebar:
         scenario_picker()
-        st.info("AI를 호출하지 않는 시연입니다. 선호는 설계된 것이고 집계는 코드가 계산합니다.")
-    arrow_demo.render()
+        key_panel()
+    arrow_demo.render(ask if API_KEY else None)
     st.stop()
 
 SC = SCENARIOS[ss.sc]
@@ -158,8 +197,7 @@ with st.sidebar:
             ss.demo = new_demo
             reset()
             st.rerun()
-    else:
-        st.info("API 키가 없어 예시 재생 모드로 실행 중입니다.")
+    key_panel()
     with st.expander("사례 자료", expanded=False):
         st.text(CASE)
     if st.button("처음부터 다시"):
@@ -254,7 +292,7 @@ if ss.phase == "chat":
                     reply = st.write_stream(stream(system_prompt(SC, stage, carry_text()), api_msgs))
                 except Exception as e:
                     chat.pop()
-                    st.error(f"AI 호출에 실패했습니다. 잠시 뒤 다시 입력하거나 사이드바에서 예시 재생 모드를 켜세요. ({type(e).__name__})")
+                    st.error(explain(e))
                     st.stop()
             chat.append({"role": "assistant", "content": reply})
             st.rerun()
@@ -265,7 +303,7 @@ if ss.phase == "chat":
             try:
                 d, coach = decide(stage)
             except Exception as e:
-                st.error(f"AI 호출에 실패했습니다. 다시 눌러 주세요. ({type(e).__name__})")
+                st.error(explain(e))
                 st.stop()
         ss.results[key] = {"decision": d, "coach": coach}
         ss.phase = "result"
