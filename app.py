@@ -4,6 +4,8 @@
 import json
 import os
 import re
+import time
+import uuid
 
 import streamlit as st
 
@@ -27,28 +29,68 @@ DEFAULT_MODEL = secret("MODEL", "claude-opus-5-5")
 ACCESS_CODE = secret("ACCESS_CODE")
 
 
+SESSION_CAP = 60     # 공개 키로 한 접속자가 쓸 수 있는 호출 수
+SHARED_CAP = 1500    # 공개 한 번에 전체 접속자가 쓸 수 있는 호출 수
+
+
+@st.cache_resource
+def shared():
+    """발표자가 공개한 키. 서버 메모리에만 있고, 시간이 지나거나 앱이 재시작되면 사라진다."""
+    return {"key": "", "model": "", "until": 0.0, "calls": 0, "owner": ""}
+
+
+def shared_left():
+    sh = shared()
+    if sh["key"] and (time.time() >= sh["until"] or sh["calls"] >= SHARED_CAP):
+        sh.update(key="", until=0.0, owner="")
+    return max(0, int((sh["until"] - time.time()) // 60) + 1) if sh["key"] else 0
+
+
+def creds():
+    s = st.session_state
+    if s.get("api_key"):
+        return s["api_key"], s["model"], False
+    if shared_left():
+        return shared()["key"], shared()["model"], True
+    return "", "", False
+
+
+class LimitReached(Exception):
+    pass
+
+
 def client():
-    """키는 이 브라우저 세션의 메모리에만 둔다. 파일이나 저장소에 기록하지 않는다."""
-    if "_client" not in st.session_state:
+    """키는 서버 메모리에만 둔다. 파일이나 저장소에 기록하지 않는다."""
+    key, model, is_shared = creds()
+    s = st.session_state
+    if is_shared:
+        if s.get("shared_calls", 0) >= SESSION_CAP:
+            raise LimitReached()
+        s["shared_calls"] = s.get("shared_calls", 0) + 1
+        shared()["calls"] += 1
+    if s.get("_client_key") != key:
         import anthropic
-        st.session_state["_client"] = anthropic.Anthropic(api_key=st.session_state["api_key"])
-    return st.session_state["_client"]
+        s["_client"] = anthropic.Anthropic(api_key=key)
+        s["_client_key"] = key
+    return s["_client"], model
 
 
 def ask(system, messages, max_tokens=700):
-    r = client().messages.create(model=st.session_state["model"], max_tokens=max_tokens,
-                                 system=system, messages=messages)
+    c, model = client()
+    r = c.messages.create(model=model, max_tokens=max_tokens, system=system, messages=messages)
     return "".join(b.text for b in r.content if b.type == "text").strip()
 
 
 def stream(system, messages):
-    with client().messages.stream(model=st.session_state["model"], max_tokens=700,
-                                  system=system, messages=messages) as s:
+    c, model = client()
+    with c.messages.stream(model=model, max_tokens=700, system=system, messages=messages) as s:
         yield from s.text_stream
 
 
 def explain(e):
     n = type(e).__name__
+    if n == "LimitReached":
+        return "이 창에서 쓸 수 있는 실시간 대화 횟수를 모두 썼습니다. 예시 재생 모드로 계속 볼 수 있습니다."
     return {"AuthenticationError": "API 키가 올바르지 않습니다. 사이드바에서 다시 입력하세요.",
             "NotFoundError": "모델 이름을 찾을 수 없습니다. 사이드바의 모델 이름을 확인하세요.",
             "PermissionDeniedError": "이 키로는 해당 모델을 쓸 수 없습니다.",
@@ -64,8 +106,11 @@ ss.setdefault("chats", {})           # key → [{"role","content"}]
 ss.setdefault("results", {})         # key → {"decision":…, "coach":…}
 ss.setdefault("api_key", "")
 ss.setdefault("model", DEFAULT_MODEL)
-API_KEY = ss.api_key
+ss.setdefault("sid", uuid.uuid4().hex)
+API_KEY, _, USING_SHARED = creds()
 ss.setdefault("demo", not API_KEY)
+if not API_KEY:
+    ss.demo = True
 ss.setdefault("demo_pos", 0)
 ss.setdefault("authed", not ACCESS_CODE)
 
@@ -86,19 +131,33 @@ def scenario_picker():
                  format_func=lambda i: SCENARIOS[i]["name"])
 
 
+def _on_demo():
+    ss.demo = ss.demo_toggle
+    reset()
+
+
 def _on_key():
     ss.api_key = ss.key_input.strip()
-    ss.pop("_client", None)
     ss.demo = not ss.api_key
     reset()
 
 
+def _stop_share():
+    sh = shared()
+    if sh["key"] and sh["key"] == ss.api_key:
+        sh.update(key="", until=0.0, owner="")
+
+
 def _clear_key():
+    _stop_share()
     ss.api_key = ""
     ss.key_input = ""
-    ss.pop("_client", None)
     ss.demo = True
     reset()
+
+
+def _start_share():
+    shared().update(key=ss.api_key, model=ss.model, until=time.time() + ss.share_min * 60, calls=0, owner=ss.sid)
 
 
 def key_panel():
@@ -108,9 +167,20 @@ def key_panel():
         st.text_input("모델", key="model")
         if ss.api_key:
             st.success("키 입력됨 · 실시간 모드 사용 가능")
+            sh = shared(); left = shared_left()
+            if left and sh["key"] == ss.api_key:
+                st.warning(f"다른 접속자에게 공개 중 · 약 {left}분 남음 · {sh['calls']}회 사용됨")
+                st.button("공개 중지", on_click=_stop_share, type="primary")
+            else:
+                st.selectbox("공개 시간(분)", [10, 20, 30, 60], index=1, key="share_min")
+                st.button("다른 접속자에게 실시간 모드 열기", on_click=_start_share,
+                          help="정한 시간 동안 이 주소에 접속한 모든 사람이 내 키로 실시간 대화를 할 수 있습니다.")
             st.button("키 지우기", on_click=_clear_key)
         else:
             st.caption("키가 없으면 예시 재생(시연) 모드로만 동작합니다.")
+    if USING_SHARED:
+        st.info(f"발표자가 실시간 모드를 열었습니다 · 약 {shared_left()}분 남음."
+                + (" '예시 재생 모드'를 끄면 직접 대화할 수 있습니다." if ss.demo else " 직접 입력해 대화할 수 있습니다."))
 
 
 # ── 접속코드 ────────────────────────────────────────────
@@ -191,12 +261,9 @@ with st.sidebar:
             st.markdown(f"◻️ {s['title']}")
     st.divider()
     if API_KEY:
-        new_demo = st.toggle("예시 재생 모드", value=ss.demo,
-                             help="사전에 작성한 예시 대화를 재생합니다. AI를 호출하지 않습니다.")
-        if new_demo != ss.demo:
-            ss.demo = new_demo
-            reset()
-            st.rerun()
+        ss.demo_toggle = ss.demo
+        st.toggle("예시 재생 모드", key="demo_toggle", on_change=_on_demo,
+                  help="사전에 작성한 예시 대화를 재생합니다. AI를 호출하지 않습니다.")
     key_panel()
     with st.expander("사례 자료", expanded=False):
         st.text(CASE)
